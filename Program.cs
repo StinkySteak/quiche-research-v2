@@ -4,6 +4,7 @@ using System.Buffers;
 using System.Collections;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
@@ -12,7 +13,7 @@ namespace QuichePlaygroundLibrary
 {
     internal unsafe class Program
     {
-        private const string QUICHE_H3_APPLICATION_PROTOCOL = "\x02h3";
+        private const string QUICHE_H3_APPLICATION_PROTOCOL = "h3";
         private const int MAX_DATAGRAM_SIZE = 1350;
 
         private static void EnableDebugLogging()
@@ -25,66 +26,134 @@ namespace QuichePlaygroundLibrary
             Console.WriteLine($"isDebugLogEnabled {debugLog == 0}");
         }
 
+        private static Conn* _connection;
+        private static QuicheConfig _config;
+
+        private static void CreateConfig()
+        {
+            _config = new QuicheConfig();
+            _config.ShouldVerifyPeer = false;
+            _config.SetApplicationProtocols(QUICHE_H3_APPLICATION_PROTOCOL);
+            _config.MaxIdleTimeout = 5000;
+            _config.MaxReceiveUdpPayloadSize = MAX_DATAGRAM_SIZE;
+            _config.MaxSendUdpPayloadSize = MAX_DATAGRAM_SIZE;
+
+            _config.MaxInitialDataSize = 10_000_000;
+
+            _config.MaxInitialLocalBidiStreamDataSize = 1_000_000;
+            _config.MaxInitialRemoteBidiStreamDataSize = 1_000_000;
+            _config.MaxInitialUniStreamDataSize = 1_000_000;
+            _config.MaxInitialBidiStreams = 1_000_000;
+
+            _config.MaxInitialBidiStreams = 100;
+            _config.MaxInitialUniStreams = 100;
+            _config.IsActiveMigrationDisabled = true;
+        }
+
+        private static byte[] buffer;
+        private static byte* bufferPtr;
+
+        private static byte[] outBuffer;
+        private static byte* outBufferPtr;
+
+        private static Socket _client;
+        private static IPEndPoint _remoteEndPoint;
+        private const string Hostname = "google.com";
+
+        private static void ConstructBuffer()
+        {
+            buffer = new byte[65535];
+            outBuffer = new byte[MAX_DATAGRAM_SIZE];
+            bufferPtr = (byte*)Marshal.UnsafeAddrOfPinnedArrayElement(buffer, 0);
+            outBufferPtr = (byte*)Marshal.UnsafeAddrOfPinnedArrayElement(outBuffer, 0);
+        }
+
         static void Main(string[] args)
         {
             //EnableDebugLogging();
 
-            QuicheConfig config = new QuicheConfig();
-            config.ShouldVerifyPeer = false;
-            config.SetApplicationProtocols(QUICHE_H3_APPLICATION_PROTOCOL);
-            config.MaxIdleTimeout = 5000;
-            config.MaxReceiveUdpPayloadSize = MAX_DATAGRAM_SIZE;
-            config.MaxSendUdpPayloadSize = MAX_DATAGRAM_SIZE;
+            ConstructBuffer();
+            CreateConfig();
+            ConstructPeers();
 
-            config.MaxInitialDataSize = 10_000_000;
+            _connection = Connect(_client, _remoteEndPoint, _config, Hostname);
 
-            config.MaxInitialLocalBidiStreamDataSize = 1_000_000;
-            config.MaxInitialRemoteBidiStreamDataSize = 1_000_000;
-            config.MaxInitialUniStreamDataSize = 1_000_000;
-
-            config.MaxInitialBidiStreams = 100;
-            config.MaxInitialUniStreams = 100;
-            config.IsActiveMigrationDisabled = true;
-
-            string hostname = "google.com";
-
-            // Local
-
-            UdpClient udpClient = new UdpClient(0, AddressFamily.InterNetwork);
-
-            Socket client = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-            client.Bind(new IPEndPoint(IPAddress.Any, 0));
-
-            // Remote
-            IPHostEntry remoteHost = Dns.GetHostEntry(hostname);
-            IPAddress remoteIpAddress = remoteHost.AddressList[0];
-            IPEndPoint remoteEndPoint = new IPEndPoint(remoteIpAddress, 443);
-
-            byte[] buffer = new byte[65535];
-            byte* bufferPtr = (byte*)Marshal.UnsafeAddrOfPinnedArrayElement(buffer, 0);
-
-            byte[] outBuffer = new byte[MAX_DATAGRAM_SIZE];
-            byte* outBufferPtr = (byte*)Marshal.UnsafeAddrOfPinnedArrayElement(outBuffer, 0);
-
-            Conn* connection = Connect(client, remoteEndPoint, config, hostname);
+            Debug($"Initial - Connecting to: {_remoteEndPoint} from: {_client.LocalEndPoint}");
 
             SendInfo sendInfo = new SendInfo();
+            //nint result = SendOnPath(_connection, _client, _remoteEndPoint, outBufferPtr, (nuint)outBuffer.Length, &sendInfo);
 
-            Debug($"bufferPtr: {(IntPtr)bufferPtr} outBufferPtr: {(IntPtr)outBufferPtr}");
-            Debug($"Connecting to: {remoteEndPoint} from: {client.LocalEndPoint}");
+            nint write = _connection->Send(outBufferPtr, (nuint)outBuffer.Length, &sendInfo);
+            int r = _client.SendTo(outBuffer, (int)write, SocketFlags.None, _remoteEndPoint);
 
-            nint result = SendOnPath(connection, client, remoteEndPoint, outBufferPtr, (nuint)outBuffer.Length, &sendInfo);
+            Debug($"Initial - Write: {write}");
 
-            Debug($"Send on Path result: {result} sendInfoFromLen: {sendInfo.to.ss_family}");
+            //Thread outgoingPackets = new Thread(new ThreadStart(WriteLoop));
+            //outgoingPackets.Start();
 
-            client.SendTo(outBuffer, 0, (int)result, SocketFlags.None, remoteEndPoint);
+            //Console.ReadKey();
+
+            Thread readLoop = new Thread(new ThreadStart(ReadLoop));
+            readLoop.Start();
+
+            Console.ReadKey();
+        }
+
+        private static void ConstructPeers()
+        {
+            _client = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+            _client.Bind(new IPEndPoint(IPAddress.Any, 0));
+
+            // Remote
+            IPHostEntry remoteHost = Dns.GetHostEntry(Hostname);
+            IPAddress remoteIpAddress = remoteHost.AddressList[0];
+            _remoteEndPoint = new IPEndPoint(remoteIpAddress, 443);
+        }
+
+        private static void ReadLoop()
+        {
+            var (local, local_len) = GetSocketAddress(_client.LocalEndPoint);
+            RecvInfo recvInfo = new RecvInfo();
+            recvInfo.to_len = local_len;
+            recvInfo.to = (sockaddr*)local.Pointer;
 
             while (true)
             {
-                Console.WriteLine($"Is Established: {connection->IsEstablished()}");
-                Thread.Sleep(500);
+                Thread.Sleep(1000);
+                Console.WriteLine($"ReadLoop isClosed: {_connection->IsClosed()}");
+                EndPoint ep = _remoteEndPoint;
+
+                Console.WriteLine($"ReadLoop - Socket Receiving...");
+                int resultOrError = _client.Receive(buffer);
+                Console.WriteLine($"ReadLoop Received: {resultOrError}");
+
+                //if (resultOrError < 0)
+                //    continue;
+
+                Console.WriteLine($"ReadLoop QUIC Receiving...");
+                _connection->Recv(bufferPtr, (nuint)resultOrError, &recvInfo);
+                Console.WriteLine($"ReadLoop QUIC Received...");
             }
         }
+
+        private static void WriteLoop()
+        {
+            while (true)
+            {
+                SendInfo s = new SendInfo();
+                nint write = _connection->Send(outBufferPtr, (nuint)outBuffer.Length, &s);
+
+                Console.WriteLine($"write: {write}");
+
+                if (write < 0)
+                {
+                    _client.SendTo(outBuffer, 0, (int)write, SocketFlags.None, _remoteEndPoint);
+                }
+
+                Thread.Sleep(100);
+            }
+        }
+
         private static GCHandle callbackHandle = default;
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
