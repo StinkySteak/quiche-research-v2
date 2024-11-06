@@ -27,6 +27,7 @@ namespace QuichePlaygroundLibrary
         }
 
         private static Conn* _connection;
+        private static H3Conn* _h3Connection;
         private static QuicheConfig _config;
 
         private static void CreateConfig()
@@ -34,7 +35,7 @@ namespace QuichePlaygroundLibrary
             _config = new QuicheConfig();
             _config.ShouldVerifyPeer = false;
             _config.SetApplicationProtocols(QUICHE_H3_APPLICATION_PROTOCOL);
-            _config.MaxIdleTimeout = 5000;
+            _config.MaxIdleTimeout = 5000000;
             _config.MaxReceiveUdpPayloadSize = MAX_DATAGRAM_SIZE;
             _config.MaxSendUdpPayloadSize = MAX_DATAGRAM_SIZE;
 
@@ -70,6 +71,7 @@ namespace QuichePlaygroundLibrary
 
         static void Main(string[] args)
         {
+            //   _h3Connection = NativeMethods.quiche_h3_conn_new_with_transport(_connection, );
             //EnableDebugLogging();
 
             ConstructBuffer();
@@ -77,24 +79,25 @@ namespace QuichePlaygroundLibrary
             ConstructPeers();
 
             _connection = Connect(_client, _remoteEndPoint, _config, Hostname);
+            _client.Blocking = false;
 
             Debug($"Initial - Connecting to: {_remoteEndPoint} from: {_client.LocalEndPoint}");
 
             SendInfo sendInfo = new SendInfo();
             //nint result = SendOnPath(_connection, _client, _remoteEndPoint, outBufferPtr, (nuint)outBuffer.Length, &sendInfo);
+            Console.WriteLine($"isClosed: {_connection->IsInEarlyData()}");
 
             nint write = _connection->Send(outBufferPtr, (nuint)outBuffer.Length, &sendInfo);
             int r = _client.SendTo(outBuffer, (int)write, SocketFlags.None, _remoteEndPoint);
 
             Debug($"Initial - Write: {write}");
-
-            //Thread outgoingPackets = new Thread(new ThreadStart(WriteLoop));
-            //outgoingPackets.Start();
-
-            //Console.ReadKey();
+            Console.WriteLine($"isClosed: {_connection->IsInEarlyData()}");
 
             Thread readLoop = new Thread(new ThreadStart(ReadLoop));
             readLoop.Start();
+
+            //Thread outgoingPackets = new Thread(new ThreadStart(WriteLoop));
+            //outgoingPackets.Start();
 
             Console.ReadKey();
         }
@@ -112,27 +115,50 @@ namespace QuichePlaygroundLibrary
 
         private static void ReadLoop()
         {
-            var (local, local_len) = GetSocketAddress(_client.LocalEndPoint);
-            RecvInfo recvInfo = new RecvInfo();
-            recvInfo.to_len = local_len;
-            recvInfo.to = (sockaddr*)local.Pointer;
-
             while (true)
             {
-                Thread.Sleep(1000);
-                Console.WriteLine($"ReadLoop isClosed: {_connection->IsClosed()}");
-                EndPoint ep = _remoteEndPoint;
+                Thread.Sleep(500);
 
-                Console.WriteLine($"ReadLoop - Socket Receiving...");
+                Console.WriteLine($"ReadLoop - Socket Receiving... isEstablished: {_connection->IsEstablished()}");
+
+                bool noMorePacketsToRead = _client.Available <= 0;
+
+                if (noMorePacketsToRead)
+                {
+                    Debug("ReadLoop - No more packets to read");
+                    break;
+                }
+
                 int resultOrError = _client.Receive(buffer);
+
                 Console.WriteLine($"ReadLoop Received: {resultOrError}");
 
-                //if (resultOrError < 0)
-                //    continue;
+                if (resultOrError < 0)
+                    continue;
+
+                var (to, to_len) = GetSocketAddress(_client.LocalEndPoint);
+                var (from, from_len) = GetSocketAddress(_remoteEndPoint);
+
+                RecvInfo recvInfo = new RecvInfo
+                {
+                    to = (sockaddr*)to.Pointer,
+                    to_len = to_len,
+
+                    from = (sockaddr*)from.Pointer,
+                    from_len = from_len,
+                };
 
                 Console.WriteLine($"ReadLoop QUIC Receiving...");
-                _connection->Recv(bufferPtr, (nuint)resultOrError, &recvInfo);
-                Console.WriteLine($"ReadLoop QUIC Received...");
+                nint read = NativeMethods.quiche_conn_recv(_connection, bufferPtr, (nuint)resultOrError, &recvInfo);
+                Console.WriteLine($"ReadLoop QUIC Received... len: {read}");
+            }
+
+            Thread outgoingPackets = new Thread(new ThreadStart(WriteLoop));
+            outgoingPackets.Start();
+
+            if (_connection->IsEstablished() && _h3Connection == null)
+            {
+
             }
         }
 
@@ -140,18 +166,27 @@ namespace QuichePlaygroundLibrary
         {
             while (true)
             {
-                SendInfo s = new SendInfo();
-                nint write = _connection->Send(outBufferPtr, (nuint)outBuffer.Length, &s);
+                SendInfo sendInfo = new SendInfo();
+                nint write = _connection->Send(outBufferPtr, (nuint)outBuffer.Length, &sendInfo);
 
-                Console.WriteLine($"write: {write}");
+                Console.WriteLine($"WriteLoop - QUIC Send: {write}");
 
-                if (write < 0)
+                bool noMorePacketsToRead = write <= 0;
+
+                if (noMorePacketsToRead)
                 {
-                    _client.SendTo(outBuffer, 0, (int)write, SocketFlags.None, _remoteEndPoint);
+                    Debug("WriteLoop - No more packets to send");
+                    break;
                 }
+
+                Console.WriteLine($"WriteLoop - Socket Send: {write}");
+
+                _client.SendTo(outBuffer, 0, (int)write, SocketFlags.None, _remoteEndPoint);
 
                 Thread.Sleep(100);
             }
+
+            ReadLoop();
         }
 
         private static GCHandle callbackHandle = default;
