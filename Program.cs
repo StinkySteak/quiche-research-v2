@@ -8,6 +8,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using static Quiche.NativeMethodsGroupingExtensions;
 
 namespace QuichePlaygroundLibrary
 {
@@ -61,6 +62,8 @@ namespace QuichePlaygroundLibrary
         private static IPEndPoint _remoteEndPoint;
         private const string Hostname = "google.com";
 
+        private const int HEADER_LENGTH = 5;
+
         private static void ConstructBuffer()
         {
             buffer = new byte[65535];
@@ -69,8 +72,71 @@ namespace QuichePlaygroundLibrary
             outBufferPtr = (byte*)Marshal.UnsafeAddrOfPinnedArrayElement(outBuffer, 0);
         }
 
+        private static void TestHeaders()
+        {
+            H3Header[] header = ConstructHeaders();
+            H3Header* headerPtr = (H3Header*)Marshal.UnsafeAddrOfPinnedArrayElement(header, 0);
+
+            NativeMethods.quiche_h3_send_request( ,, headerPtr, HEADER_LENGTH, true);
+        }
+
+        private static void ReadLoopH3()
+        {
+            H3Event* h3Event = null;
+
+            long streamId = _h3Connection->Poll(_connection, &h3Event);
+
+            quiche_h3_event_type eventType = (quiche_h3_event_type)NativeMethods.quiche_h3_event_type(h3Event);
+
+            switch (eventType)
+            {
+                case quiche_h3_event_type.QUICHE_H3_EVENT_HEADERS:
+                    {
+                        var callback = new OnForEachHeaderCallback(ForEachHeaderCallback);
+                        _logCallbackHandle = GCHandle.Alloc(callback);
+                        var pCallback = (delegate* unmanaged[Cdecl]<byte*, nuint, byte*, nuint, void*, int>)(void*)Marshal.GetFunctionPointerForDelegate(callback);
+                        int rc = NativeMethods.quiche_h3_event_for_each_header(h3Event, pCallback, null);
+
+                        if (rc != 0)
+                        {
+                            Debug("Error");
+                            break;
+                        }
+
+                        break;
+                    }
+                case quiche_h3_event_type.QUICHE_H3_EVENT_DATA:
+                    {
+                        while (true)
+                        {
+                            nint len = NativeMethods.quiche_h3_recv_body(_h3Connection, _connection, default, bufferPtr, (nuint)buffer.Length);
+
+                            if (len <= 0)
+                                break;
+                        }
+
+                        break;
+                    }
+
+                case quiche_h3_event_type.QUICHE_H3_EVENT_FINISHED:
+
+                    int r = NativeMethods.quiche_conn_close(_connection, true, 0, null, 0);
+
+
+
+                    break;
+            }
+        }
+
+        private static int ForEachHeaderCallback(byte* name, nuint name_len, byte* value, nuint value_len, void* argp)
+        {
+            return 0;
+        }
+
         static void Main(string[] args)
         {
+            TestHeaders();
+            return;
             //   _h3Connection = NativeMethods.quiche_h3_conn_new_with_transport(_connection, );
             //EnableDebugLogging();
 
@@ -156,10 +222,10 @@ namespace QuichePlaygroundLibrary
             Thread outgoingPackets = new Thread(new ThreadStart(WriteLoop));
             outgoingPackets.Start();
 
-            if (_connection->IsEstablished() && _h3Connection == null)
-            {
+            //if (_connection->IsEstablished() && _h3Connection == null)
+            //{
 
-            }
+            //}
         }
 
         private static void WriteLoop()
@@ -189,7 +255,8 @@ namespace QuichePlaygroundLibrary
             ReadLoop();
         }
 
-        private static GCHandle callbackHandle = default;
+        private static GCHandle _logCallbackHandle = default;
+        private static GCHandle _forEachHeaderCallbackHandle = default;
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         public delegate void OnQuicheLogCallback(byte* handle, void* context);
@@ -198,6 +265,8 @@ namespace QuichePlaygroundLibrary
             string msg = Marshal.PtrToStringAnsi((IntPtr)message) ?? string.Empty;
             Console.WriteLine($"OnQuicheLog: {msg}");
         }
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int OnForEachHeaderCallback(byte* name, nuint name_len, byte* value, nuint value_len, void* argp);
 
         private static (MemoryHandle, int) GetSocketAddress(EndPoint? endPoint)
         {
@@ -248,34 +317,40 @@ namespace QuichePlaygroundLibrary
             }
         }
 
-        private H3Header[] ConstructHeaders()
+        private static H3Header[] ConstructHeaders()
         {
-            Dictionary<string, string> managedHeaders = new Dictionary<string, string>()
-            {
-                ["GET"] = "method",
-                ["scheme"] = "",
-                ["authority"] = "",
-                ["path"] = "",
-                ["user-agent"] = "quiche",
-            };
+            string urlScheme = "https"; // Replace with your URL scheme
+            string urlHost = "google"; // Replace with your URL host
+            string urlPath = "/"; // Replace with your URL path
 
-            H3Header[] headers = new H3Header[managedHeaders.Count];
-            int index = 0;
-
-            foreach (var h in managedHeaders)
-            {
-                H3Header header = new H3Header();
-                header.name = (byte*)Marshal.StringToHGlobalAnsi(h.Key);
-                header.name_len = (nuint)h.Key.Length;
-
-                header.value = (byte*)Marshal.StringToHGlobalAnsi(h.Value);
-                header.value_len = (nuint)h.Value.Length;
-
-                headers[index] = header;
-                index++;
-            }
+            H3Header[] headers =
+            [
+                Create(":method", "GET"),
+                Create(":scheme", urlScheme),
+                Create(":authority", urlHost),
+                Create(":path", urlPath),
+                Create("user-agent", "quiche")
+            ];
 
             return headers;
+        }
+
+        public static H3Header Create(string name, string value)
+        {
+            var header = new H3Header();
+
+            byte[] nameBytes = Encoding.ASCII.GetBytes(name);
+            byte[] valueBytes = Encoding.ASCII.GetBytes(value);
+
+            fixed (byte* namePtr = nameBytes, valuePtr = valueBytes)
+            {
+                header.name = namePtr;
+                header.name_len = (nuint)nameBytes.Length;
+                header.value = valuePtr;
+                header.value_len = (nuint)valueBytes.Length;
+            }
+
+            return header;
         }
 
         private static void Debug(string message)

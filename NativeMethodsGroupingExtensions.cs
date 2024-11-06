@@ -933,6 +933,14 @@ namespace Quiche
         }
 
         #endregion
-
+        public enum quiche_h3_event_type
+        {
+            QUICHE_H3_EVENT_HEADERS,
+            QUICHE_H3_EVENT_DATA,
+            QUICHE_H3_EVENT_FINISHED,
+            QUICHE_H3_EVENT_GOAWAY,
+            QUICHE_H3_EVENT_RESET,
+            QUICHE_H3_EVENT_PRIORITY_UPDATE,
+        };
     }
 }
