@@ -19,16 +19,18 @@ namespace QuichePlaygroundLibrary
 
         private static void EnableDebugLogging()
         {
-            var callback = new OnQuicheLogCallback(OnQuicheLog);
-            callbackHandle = GCHandle.Alloc(callback);
-            var pCallback = (delegate* unmanaged[Cdecl]<byte*, void*, void>)(void*)Marshal.GetFunctionPointerForDelegate(callback);
-            int debugLog = NativeMethods.quiche_enable_debug_logging(pCallback, null);
+            //var callback = new OnQuicheLogCallback(OnQuicheLog);
+            //callbackHandle = GCHandle.Alloc(callback);
+            //var pCallback = (delegate* unmanaged[Cdecl]<byte*, void*, void>)(void*)Marshal.GetFunctionPointerForDelegate(callback);
+            //int debugLog = NativeMethods.quiche_enable_debug_logging(pCallback, null);
 
-            Console.WriteLine($"isDebugLogEnabled {debugLog == 0}");
+            //Console.WriteLine($"isDebugLogEnabled {debugLog == 0}");
         }
 
         private static Conn* _connection;
         private static H3Conn* _h3Connection;
+        private static H3Config* _h3ConfigPtr;
+        private static H3Config _h3Config;
         private static QuicheConfig _config;
 
         private static void CreateConfig()
@@ -62,7 +64,6 @@ namespace QuichePlaygroundLibrary
         private static IPEndPoint _remoteEndPoint;
         private const string Hostname = "google.com";
 
-        private const int HEADER_LENGTH = 5;
 
         private static void ConstructBuffer()
         {
@@ -70,74 +71,23 @@ namespace QuichePlaygroundLibrary
             outBuffer = new byte[MAX_DATAGRAM_SIZE];
             bufferPtr = (byte*)Marshal.UnsafeAddrOfPinnedArrayElement(buffer, 0);
             outBufferPtr = (byte*)Marshal.UnsafeAddrOfPinnedArrayElement(outBuffer, 0);
+            Headers = ConstructHeaders();
         }
 
-        private static void TestHeaders()
-        {
-            H3Header[] header = ConstructHeaders();
-            H3Header* headerPtr = (H3Header*)Marshal.UnsafeAddrOfPinnedArrayElement(header, 0);
+        private static long _streamId;
 
-            NativeMethods.quiche_h3_send_request( ,, headerPtr, HEADER_LENGTH, true);
-        }
-
-        private static void ReadLoopH3()
-        {
-            H3Event* h3Event = null;
-
-            long streamId = _h3Connection->Poll(_connection, &h3Event);
-
-            quiche_h3_event_type eventType = (quiche_h3_event_type)NativeMethods.quiche_h3_event_type(h3Event);
-
-            switch (eventType)
-            {
-                case quiche_h3_event_type.QUICHE_H3_EVENT_HEADERS:
-                    {
-                        var callback = new OnForEachHeaderCallback(ForEachHeaderCallback);
-                        _logCallbackHandle = GCHandle.Alloc(callback);
-                        var pCallback = (delegate* unmanaged[Cdecl]<byte*, nuint, byte*, nuint, void*, int>)(void*)Marshal.GetFunctionPointerForDelegate(callback);
-                        int rc = NativeMethods.quiche_h3_event_for_each_header(h3Event, pCallback, null);
-
-                        if (rc != 0)
-                        {
-                            Debug("Error");
-                            break;
-                        }
-
-                        break;
-                    }
-                case quiche_h3_event_type.QUICHE_H3_EVENT_DATA:
-                    {
-                        while (true)
-                        {
-                            nint len = NativeMethods.quiche_h3_recv_body(_h3Connection, _connection, default, bufferPtr, (nuint)buffer.Length);
-
-                            if (len <= 0)
-                                break;
-                        }
-
-                        break;
-                    }
-
-                case quiche_h3_event_type.QUICHE_H3_EVENT_FINISHED:
-
-                    int r = NativeMethods.quiche_conn_close(_connection, true, 0, null, 0);
-
-
-
-                    break;
-            }
-        }
 
         private static int ForEachHeaderCallback(byte* name, nuint name_len, byte* value, nuint value_len, void* argp)
         {
+            string n = System.Text.Encoding.UTF8.GetString(name, (int)name_len);
+            string v = System.Text.Encoding.UTF8.GetString(value, (int)value_len);
+
+            Debug($"H3 - Got HTTP Header: name: {n} value: {v}");
             return 0;
         }
 
         static void Main(string[] args)
         {
-            TestHeaders();
-            return;
-            //   _h3Connection = NativeMethods.quiche_h3_conn_new_with_transport(_connection, );
             //EnableDebugLogging();
 
             ConstructBuffer();
@@ -150,7 +100,6 @@ namespace QuichePlaygroundLibrary
             Debug($"Initial - Connecting to: {_remoteEndPoint} from: {_client.LocalEndPoint}");
 
             SendInfo sendInfo = new SendInfo();
-            //nint result = SendOnPath(_connection, _client, _remoteEndPoint, outBufferPtr, (nuint)outBuffer.Length, &sendInfo);
             Console.WriteLine($"isClosed: {_connection->IsInEarlyData()}");
 
             nint write = _connection->Send(outBufferPtr, (nuint)outBuffer.Length, &sendInfo);
@@ -159,13 +108,36 @@ namespace QuichePlaygroundLibrary
             Debug($"Initial - Write: {write}");
             Console.WriteLine($"isClosed: {_connection->IsInEarlyData()}");
 
-            Thread readLoop = new Thread(new ThreadStart(ReadLoop));
-            readLoop.Start();
+            bool reqSent = false;
+            _h3ConfigPtr = NativeMethods.quiche_h3_config_new();
 
-            //Thread outgoingPackets = new Thread(new ThreadStart(WriteLoop));
-            //outgoingPackets.Start();
+            while (true)
+            {
+                ReadLoop();
 
-            Console.ReadKey();
+
+                if (_connection->IsEstablished() && _h3Connection == null)
+                {
+                    Debug($"H3 - Creating Connection...");
+                    _h3Connection = NativeMethods.quiche_h3_conn_new_with_transport(_connection, _h3ConfigPtr);
+                    Debug($"H3 - Connection Created");
+                }
+
+                if (_h3Connection != null)
+                {
+                    if (!reqSent)
+                    {
+                        H3Header* headerPtr = (H3Header*)Marshal.UnsafeAddrOfPinnedArrayElement(Headers, 0);
+
+                        NativeMethods.quiche_h3_send_request(_h3Connection, _connection, headerPtr, HEADER_LENGTH, true);
+                        Debug($"H3 - Sending Request");
+                        reqSent = true;
+                    }
+                }
+
+                H3ReadLoop();
+                WriteLoop();
+            }
         }
 
         private static void ConstructPeers()
@@ -183,7 +155,7 @@ namespace QuichePlaygroundLibrary
         {
             while (true)
             {
-                Thread.Sleep(500);
+                Thread.Sleep(1);
 
                 Console.WriteLine($"ReadLoop - Socket Receiving... isEstablished: {_connection->IsEstablished()}");
 
@@ -218,15 +190,66 @@ namespace QuichePlaygroundLibrary
                 nint read = NativeMethods.quiche_conn_recv(_connection, bufferPtr, (nuint)resultOrError, &recvInfo);
                 Console.WriteLine($"ReadLoop QUIC Received... len: {read}");
             }
-
-            Thread outgoingPackets = new Thread(new ThreadStart(WriteLoop));
-            outgoingPackets.Start();
-
-            //if (_connection->IsEstablished() && _h3Connection == null)
-            //{
-
-            //}
         }
+        private static void H3ReadLoop()
+        {
+            if (_h3Connection == null) return;
+
+            H3Event* h3Event;
+
+            _streamId = _h3Connection->Poll(_connection, &h3Event);
+
+            Debug($"streamId: {_streamId} h3Event: {(IntPtr)h3Event}");
+
+            if (_streamId <= -1) return;
+
+            quiche_h3_event_type eventType = (quiche_h3_event_type)NativeMethods.quiche_h3_event_type(h3Event);
+
+            Debug($"EventType: {eventType}");
+
+            switch (eventType)
+            {
+                case quiche_h3_event_type.QUICHE_H3_EVENT_HEADERS:
+                    {
+                        var callback = new OnForEachHeaderCallback(ForEachHeaderCallback);
+                        _logCallbackHandle = GCHandle.Alloc(callback);
+                        var pCallback = (delegate* unmanaged[Cdecl]<byte*, nuint, byte*, nuint, void*, int>)(void*)Marshal.GetFunctionPointerForDelegate(callback);
+                        int rc = NativeMethods.quiche_h3_event_for_each_header(h3Event, pCallback, null);
+
+                        if (rc != 0)
+                        {
+                            Debug("Error");
+                            break;
+                        }
+
+                        break;
+                    }
+                case quiche_h3_event_type.QUICHE_H3_EVENT_DATA:
+                    {
+                        while (true)
+                        {
+                            nint len = NativeMethods.quiche_h3_recv_body(_h3Connection, _connection, (ulong)_streamId, bufferPtr, (nuint)buffer.Length);
+
+                            if (len <= 0)
+                                break;
+
+                            string body = System.Text.Encoding.UTF8.GetString(buffer, 0, (int)len);
+                            Debug($"receive len: {len} body: {body}");
+                        }
+
+                        break;
+                    }
+
+                case quiche_h3_event_type.QUICHE_H3_EVENT_FINISHED:
+
+                    Debug($"Closing Connection");
+                    int r = NativeMethods.quiche_conn_close(_connection, true, 0, null, 0);
+
+                    break;
+            }
+        }
+
+        private static H3Header[] Headers;
 
         private static void WriteLoop()
         {
@@ -302,34 +325,21 @@ namespace QuichePlaygroundLibrary
             }
         }
 
-        internal unsafe static nint SendOnPath(Conn* connection, Socket socket, EndPoint remoteEndPoint, byte* outBuffer, nuint outBufferLength, SendInfo* sendInfo)
-        {
-            EndPoint localEndPoint = socket.LocalEndPoint ?? throw new ArgumentException(
-                "Given socket was not bound to a valid local endpoint!", nameof(socket));
-
-            var (local, local_len) = GetSocketAddress(localEndPoint);
-            var (remote, remote_len) = GetSocketAddress(remoteEndPoint);
-
-            using (local)
-            using (remote)
-            {
-                return connection->SendOnPath(outBuffer, outBufferLength, (sockaddr*)local.Pointer, local_len, (sockaddr*)remote.Pointer, remote_len, sendInfo);
-            }
-        }
+        private const int HEADER_LENGTH = 6;
 
         private static H3Header[] ConstructHeaders()
         {
             string urlScheme = "https"; // Replace with your URL scheme
-            string urlHost = "google"; // Replace with your URL host
             string urlPath = "/"; // Replace with your URL path
 
             H3Header[] headers =
             [
                 Create(":method", "GET"),
                 Create(":scheme", urlScheme),
-                Create(":authority", urlHost),
+                Create(":authority", Hostname),
                 Create(":path", urlPath),
-                Create("user-agent", "quiche")
+                Create("user-agent", "quiche"),
+                Create("content-length", "0"),
             ];
 
             return headers;
@@ -337,10 +347,10 @@ namespace QuichePlaygroundLibrary
 
         public static H3Header Create(string name, string value)
         {
-            var header = new H3Header();
+            H3Header header = new();
 
-            byte[] nameBytes = Encoding.ASCII.GetBytes(name);
-            byte[] valueBytes = Encoding.ASCII.GetBytes(value);
+            byte[] nameBytes = Encoding.UTF8.GetBytes(name);
+            byte[] valueBytes = Encoding.UTF8.GetBytes(value);
 
             fixed (byte* namePtr = nameBytes, valuePtr = valueBytes)
             {
